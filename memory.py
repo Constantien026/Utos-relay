@@ -65,6 +65,15 @@ def push_history(who, text):
     d["history"] = d["history"][-12:]
     _save(d)
 
+def set_pending(q):
+    d = _load(); d["pending"] = q[:200]; _save(d)
+
+def take_pending():
+    d = _load()
+    q = d.pop("pending", "")
+    _save(d)
+    return q
+
 def history_text():
     d = _load()
     return "\n".join(f"{h['who']}: {h['text']}" for h in d["history"][-8:])

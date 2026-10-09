@@ -200,9 +200,126 @@ def strip_wake(q):
         q = nq
     return q
 
+def do_volume(spec):
+    import re
+    s = (spec or "").lower()
+    try:
+        from pycaw.pycaw import AudioUtilities
+        dev = AudioUtilities.GetSpeakers()
+        if "mute" in s and "unmute" not in s:
+            dev.EndpointVolume.SetMute(1, None)
+            return "Muted, boss."
+        if "unmute" in s:
+            dev.EndpointVolume.SetMute(0, None)
+            return "Unmuted, boss."
+        m = re.search(r"(\d+)\s*%?", s)
+        if m:
+            lvl = max(0, min(100, int(m.group(1)))) / 100
+            dev.EndpointVolume.SetMasterVolumeLevelScalar(lvl, None)
+            return f"Volume {int(lvl * 100)}%, boss."
+        cur = getattr(dev, "volume_percent", None)
+        if callable(cur):
+            cur = cur()
+        return f"Volume {cur}%, boss. Say volume + number."
+    except Exception as e:
+        return f"volume failed ({e}). Try volume up / down / mute."
+
+def do_brightness(spec):
+    import re
+    try:
+        import screen_brightness_control as sbc
+        m = re.search(r"(\d+)\s*%?", spec or "")
+        if m:
+            lvl = max(0, min(100, int(m.group(1))))
+            sbc.set_brightness(lvl)
+            return f"Brightness {lvl}%, boss."
+        cur = sbc.get_brightness()
+        return f"Brightness {cur[0] if cur else '?'}%. Say brightness + number."
+    except Exception as e:
+        return f"brightness failed ({e})."
+
+def find_openrgb():
+    import shutil
+    cands = [shutil.which("openrgb") or "",
+             r"C:\Program Files\OpenRGB\OpenRGB.exe",
+             os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "OpenRGB.exe")]
+    for p in cands:
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+def do_kb(spec):
+    import re, subprocess
+    m = re.search(r"(\d+)\s*%?", spec or "")
+    lvl = max(0, min(100, int(m.group(1)) if m else 100))
+    # ASUS TUF (this machine): OpenRGB drives the Aura keyboard, free, no signup.
+    orb = find_openrgb()
+    if orb:
+        try:
+            subprocess.Popen([orb, "--device", "0", "--mode", "Static",
+                              "--brightness", str(lvl)], shell=False)
+            return f"Keyboard backlight {lvl}%, boss."
+        except Exception as e:
+            return f"OpenRGB call failed ({e}). Is it running once for setup?"
+    return ("TUF keyboards need OpenRGB (free): install it, run once to detect "
+            "the Aura keyboard, then say brightness again. Quick manual: Fn+F7, "
+            "or Armoury Crate / G-Helper, boss.")
+
+def word_num(t):
+    import re
+    m = re.search(r"(\d+)", t)
+    if m:
+        return max(1, min(20, int(m.group(1))))
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+             "couple": 2, "few": 3}
+    for w, n in words.items():
+        if re.search(rf"\b{w}\b", t):
+            return n
+    return 1
+
+def focus_brave():
+    """Focus existing Brave window WITHOUT opening a new one. Returns True if focused."""
+    try:
+        import pygetwindow as _gw
+        for title in ("YouTube Music", "youtube music", " - Brave", "Brave"):
+            try:
+                wins = _gw.getWindowsWithTitle(title)
+            except Exception:
+                wins = []
+            for w in wins:
+                try:
+                    if w.isMinimized:
+                        w.restore()
+                    w.activate()
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+def do_tabs(direction, n=1):
+    try:
+        import pyautogui, time
+        pyautogui.FAILSAFE = False
+        if not focus_brave():
+            return "Brave isn't open, boss. Open it first."
+        time.sleep(0.6)
+        for _ in range(max(1, min(20, n))):
+            if direction == "back":
+                pyautogui.hotkey("ctrl", "shift", "tab")
+            else:
+                pyautogui.hotkey("ctrl", "tab")
+            time.sleep(0.25)
+        return f"Moved {n} tab(s) {direction}, boss."
+    except Exception as e:
+        return f"tab move failed: {e}"
+
 def do_media(action):
     try:
         import pyautogui
+        pyautogui.FAILSAFE = False
         keys = {"pause": "playpause", "resume": "playpause", "playpause": "playpause",
                 "next": "nexttrack", "previous": "prevtrack", "prev": "prevtrack",
                 "volume up": "volumeup", "volume down": "volumedown", "mute": "volumemute"}
@@ -217,29 +334,106 @@ def do_media(action):
     except Exception as e:
         return f"media failed: {e}"
 
+def resolve_song(query):
+    """Best watch URL for query via yt-dlp. Fuzzy-picks from top 5."""
+    try:
+        from yt_dlp import YoutubeDL
+        with YoutubeDL({"quiet": True, "noplaylist": True, "socket_timeout": 12}) as y:
+            info = y.extract_info(f"ytsearch5:{query}", download=False)
+            entries = [e for e in (info.get("entries") or []) if e and e.get("webpage_url")]
+            if not entries:
+                return None
+            import re
+            qwords = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 2]
+            def score(e):
+                t = (e.get("title") or "").lower()
+                s = sum(2 for w in qwords if w in t)
+                if "official" in t:
+                    s += 1
+                return s
+            entries.sort(key=score, reverse=True)
+            return entries[0]["webpage_url"]
+    except Exception as ex:
+        print("[UTOS] resolve failed:", ex)
+    return None
+
 def do_play(query, where="music"):
     import subprocess, urllib.parse, webbrowser
     q = (query or "").strip()
     if not q:
         return "What should I play, boss?"
-    safe = urllib.parse.quote(q)
-    if where == "youtube":
-        url = f"https://www.youtube.com/results?search_query={safe}"
-        label = "YouTube"
-    else:
-        url = f"https://music.youtube.com/search?q={safe}"
-        label = "YT Music"
-    brave = find_brave()
+    # pinned songs: "remember song <name> is <url>"
     try:
-        if brave:
-            subprocess.Popen([brave, url])
+        import memory as _mem, re as _re
+        d = _mem._load()
+        for k, v in d.get("facts", {}).items():
+            if k.startswith("song:") and k[5:] and all(
+                    w in q.lower() for w in _re.findall(r"[a-z0-9]+", k[5:]) if len(w) > 2):
+                url = v if v.startswith("http") else v
+                import subprocess as _sp, webbrowser as _wb
+                _b = find_brave()
+                if _b:
+                    _sp.Popen([_b, "--autoplay-policy=no-user-gesture-required", url])
+                else:
+                    _wb.open(url)
+                return f"Now playing '{q}', boss."
+    except Exception:
+        pass
+    url = resolve_song(q)
+    if url:
+        if where != "youtube" and "youtube.com" in url:
+            url = url.replace("www.youtube.com/watch", "music.youtube.com/watch", 1)
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}autoplay=1"
+        try:
+            import memory as _mem2
+            if (_mem2._load().get("facts", {}).get("captions", "") == "on"
+                    or "caption" in q.lower() or "subtitle" in q.lower()):
+                url += "&cc_load_policy=1&cc_lang_pref=en"
+        except Exception:
+            pass
+        brave = find_brave()
+        # no-user-gesture flag: autoplay=1 actually plays without a click
+        flag = "--autoplay-policy=no-user-gesture-required"
+        try:
+            # reuse the existing Brave tab (navigate it) so old + new never overlap
+            navigated = False
+            if brave:
+                try:
+                    import pyautogui as _pg
+                    _pg.FAILSAFE = False
+                    if not focus_brave():
+                        raise RuntimeError("no Brave window")
+                    import time as _t
+                    _t.sleep(1.0)
+                    _pg.hotkey("ctrl", "l")
+                    _t.sleep(0.4)
+                    _pg.typewrite(url, interval=0.005)
+                    _pg.press("enter")
+                    navigated = True
+                except Exception as _e:
+                    print("[UTOS] tab-reuse failed, new tab:", _e)
+            if not navigated:
+                if brave:
+                    subprocess.Popen([brave, flag, url])
+                else:
+                    webbrowser.open(url)
+            return f"Now playing '{q}', boss."
+        except Exception as e:
+            return f"play failed: {e}"
+    safe = urllib.parse.quote(q)
+    fallback = (f"https://www.youtube.com/results?search_query={safe}"
+                if where == "youtube" else f"https://music.youtube.com/search?q={safe}")
+    try:
+        if find_brave():
+            subprocess.Popen([find_brave(), fallback])
         else:
-            webbrowser.open(url)
-        return f"Playing '{q}' on {label} — tap the first result, boss."
-    except Exception as e:
-        return f"play failed: {e}"
+            webbrowser.open(fallback)
+    except Exception:
+        pass
+    return f"Couldn't auto-resolve '{q}' — opened the search, tap the first result, boss."
 
-def try_command(q):
+def try_command(q, persona="Jarvis"):
     """Natural-language -> real action. Returns reply or None."""
     import re
     t = strip_wake(q.lower()).strip()
@@ -248,6 +442,18 @@ def try_command(q):
     if m:
         target, song = m.group(1).strip(), (m.group(2) or "").strip()
         song = re.sub(r"^(me|us)\s+", "", song).strip()
+        target = re.sub(r"\s+(for me( please)?|please|up)\s*$", "", target).strip()
+        if "new tab" in target:
+            try:
+                import pyautogui
+                pyautogui.FAILSAFE = False
+                os.startfile(find_brave() or "brave")
+                import time as _t
+                _t.sleep(0.8)
+                pyautogui.hotkey("ctrl", "t")
+                return "New tab, boss."
+            except Exception as e:
+                return f"new tab failed: {e}"
         yt_alias = {"yt", "yt music", "youtube music", "music", "youtube"}
         if song and song not in ("some music", "something", "anything"):
             r1 = do_open(target if target not in ("yt",) else "yt music")
@@ -264,30 +470,105 @@ def try_command(q):
         return None
     # play X [on Y] / "play me some music"
     if re.search(r"\bplay\b", t):
-        if re.search(r"play\s+(me\s+)?(some\s+)?(music|something)\s*$", t):
+        if re.search(r"play\s+(me\s+)?(some\s+|any\s*)?(music|something|anything)(\s+please)?\s*$", t):
             return do_open("yt music")
     m = re.search(r"play\s+(.+?)(?:\s+on\s+(youtube|yt music|yt|music))?\s*$", t)
     if m:
         song, where = m.group(1).strip(), (m.group(2) or "music").strip()
+        if song.lower() in ("the music", "music", "my music"):
+            return do_media("resume")
         if song in ("it", "that", "the one", "the song"):
             return "Which song, boss? Say play + title."
         w = "youtube" if where in ("youtube", "yt") and "music" not in where else "music"
         return do_play(song, where=w)
+    # tab navigation: "go back 3 tabs", "next tab", "close tab", "new tab"
+    if re.search(r"\b(new)\s+tab\b", t) and "open" not in t:
+        try:
+            import pyautogui
+            pyautogui.FAILSAFE = False
+            os.startfile(find_brave() or "brave")
+            import time as _t
+            _t.sleep(0.8)
+            pyautogui.hotkey("ctrl", "t")
+            return "New tab, boss."
+        except Exception as e:
+            return f"new tab failed: {e}"
+    if re.search(r"\b(close|kill)\b.*\btab\b", t) or re.search(r"\btab\b.*\bclose\b", t):
+        try:
+            import pyautogui
+            pyautogui.FAILSAFE = False
+            os.startfile(find_brave() or "brave")
+            import time as _t
+            _t.sleep(0.8)
+            pyautogui.hotkey("ctrl", "w")
+            return "Closed that tab, boss."
+        except Exception as e:
+            return f"close tab failed: {e}"
+    if re.search(r"\b(back|left|previous|prev)\b", t) and "tab" in t:
+        return do_tabs("back", word_num(t))
+    if re.search(r"\b(forward|next|right)\b", t) and "tab" in t:
+        return do_tabs("forward", word_num(t))
+    # captions toggle: "captions on/off", "turn on subtitles"
+    if re.search(r"\b(captions?|subtitles?|cc)\b", t):
+        if re.search(r"\b(on|enable|show)\b", t):
+            try:
+                import memory as _mem3
+                _mem3.remember_fact("captions", "on")
+            except Exception:
+                pass
+            focus_brave()
+            try:
+                import pyautogui as _pg2, time as _t2
+                _pg2.FAILSAFE = False
+                _t2.sleep(0.6)
+                _pg2.press("c")
+            except Exception:
+                pass
+            return style("Captions on — and I'll keep them on, boss.", persona)
+        if re.search(r"\b(off|disable|hide)\b", t):
+            try:
+                import memory as _mem4
+                _mem4.remember_fact("captions", "off")
+            except Exception:
+                pass
+            focus_brave()
+            try:
+                import pyautogui as _pg3, time as _t3
+                _pg3.FAILSAFE = False
+                _t3.sleep(0.6)
+                _pg3.press("c")
+            except Exception:
+                pass
+            return style("Captions off, boss.", persona)
     # media keys
-    if any(k in t for k in ("pause the music", "pause music", "pause it")):
+    if re.search(r"\bstop\b", t) and not re.search(r"\bstop watching\b", t):
         return do_media("pause")
-    if any(k in t for k in ("resume", "continue playing")):
+    if re.search(r"\bpause\b", t):
+        return do_media("pause")
+    if any(k in t for k in ("resume", "continue playing", "unpause", "keep playing", "start the music", "start music")):
         return do_media("resume")
-    if "next song" in t or ("next" in t and "song" in t):
+    if t.strip() in ("play", "start", "play music", "start music"):
+        return do_media("resume")
+    if t.strip() in ("play", "play music", "play the music", "play it"):
+        return do_media("resume")
+    if "next song" in t or "change the music" in t or "next music" in t or "next track" in t or ("next" in t and "song" in t):
         return do_media("next")
-    if "previous song" in t or "last song" in t:
+    if "previous song" in t or "last song" in t or "previous music" in t or "last music" in t or "previous track" in t or "last track" in t:
         return do_media("previous")
     if "volume up" in t:
         return do_media("volume up")
     if "volume down" in t:
         return do_media("volume down")
-    if "mute" in t:
+    if "mute" in t and "unmute" not in t:
         return do_media("mute")
+    if "unmute" in t:
+        return do_volume("unmute")
+    if "volume" in t or "vol " in t + " " or re.match(r"^(vol|volume)\b", t):
+        return do_volume(t)
+    if "keyboard" in t and ("backlight" in t or "light" in t or "brightness" in t):
+        return do_kb(t)
+    if "brightness" in t or "dim the screen" in t or "brighten" in t:
+        return do_brightness(t)
     # direct system verbs
     if t in ("lock", "lock pc", "lock my pc", "lock it"):
         return do_lock()
@@ -311,21 +592,58 @@ def style(text, persona):
         return pre + text
     return text
 
+def _gemini_key():
+    import re
+    k = os.environ.get("GEMINI_KEY", "").strip().strip('"')
+    if k:
+        return k
+    for name in (".gemini_key", "UTOS_AutoStart.bat"):
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+            m = re.search(r'GEMINI_KEY="?([A-Za-z0-9._-]{10,})"?', txt)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return ""
 def do_chat(cmd_full, persona="Jarvis"):
     import datetime
     raw = cmd_full[5:].strip() if cmd_full.lower().startswith("chat ") else cmd_full.strip()
-    acted = try_command(raw)
+    acted = try_command(raw, persona)
     if acted == "__SCREENSHOT__":
         return "__SCREENSHOT__"
     if acted:
         return style(acted, persona)
     q = raw
     import memory as mem
-    # teach / remember / forget
+    # real-time learning FIRST: correction right after a miss ("no, ...", "the answer is ...")
     import re as _re
+    import re as _re2
+    pend0 = mem.take_pending()
+    m0 = _re2.match(r"(?:no[,.]?\s+|wrong[,.]?\s+|actually\s+|i meant\s+)(.+)", q, flags=_re2.I)
+    m02 = _re2.match(r"(?:the answer is\s+)(.+)", q, flags=_re2.I)
+    if (m0 or m02) and pend0:
+        correction = (m0 or m02).group(1).strip()
+        if len(correction) > 2:
+            # "no, X means Y" -> still a teachable pair about X
+            mm = _re.match(r"(.+?)\s+means\s+(.+)", correction, flags=_re.I)
+            if mm and len(mm.group(1)) < 60:
+                mem.teach(pend0 + " / " + mm.group(1).strip(), mm.group(2).strip())
+                mem.teach(mm.group(1).strip(), mm.group(2).strip())
+            else:
+                mem.teach(pend0, correction)
+            return style("My bad — learned. Ask me again anytime.", persona)
+    if pend0:
+        mem.set_pending(pend0)  # keep for one more turn
+    # teach / remember / forget
     m = _re.match(r"remember that (.+?) is (.+)", q, flags=_re.I)
     if m:
-        mem.remember_fact(m.group(1).strip(), m.group(2).strip())
+        k = m.group(1).strip()
+        if k.lower().startswith("song "):
+            k = "song:" + k[5:].strip()
+        mem.remember_fact(k, m.group(2).strip())
         return style(f"Noted, I'll remember {m.group(1).strip()}.", persona)
     m = _re.match(r"my name is (\w+)", q, flags=_re.I)
     if m:
@@ -348,7 +666,7 @@ def do_chat(cmd_full, persona="Jarvis"):
     if not local.startswith("Got it:"):
         mem.push_history("boss", q); mem.push_history("utos", local)
         return style(local, persona)
-    key = os.environ.get("GEMINI_KEY", "")
+    key = _gemini_key()
     if not key:
         return local + " (Tip: set GEMINI_KEY on PC for full Jarvis answers.)"
     pstyle = PERSONAS.get(persona, PERSONAS["Jarvis"])[0]
@@ -368,6 +686,19 @@ def do_chat(cmd_full, persona="Jarvis"):
                 j = json.loads(r.read().decode())
                 ans = j["candidates"][0]["content"]["parts"][0]["text"][:1200]
                 mem.push_history("boss", q); mem.push_history("utos", ans)
+                # cache stable answers so offline-me still knows them later
+                if not _re.search(r"\b(time|date|today|weather|temperature|ram|status|battery)\b", q, flags=_re.I):
+                    d = mem._load()
+                    learned = d.get("learned", {})
+                    if len(learned) < 100:
+                        learned[q.lower().strip()] = ans
+                        d["learned"] = learned
+                        try:
+                            import json as _js
+                            with open(mem.MEM, "w", encoding="utf-8") as _f:
+                                _js.dump(d, _f, ensure_ascii=False, indent=1)
+                        except Exception:
+                            pass
                 return style(ans, persona)
         except Exception as e:
             print(f"[UTOS] {model} failed: {e}")
@@ -460,6 +791,8 @@ def offline_answer(q, persona="Jarvis"):
         if k in ql:
             return v
     qq = ql[5:] if ql.startswith("chat ") else ql
+    import memory as _mem9
+    _mem9.set_pending(qq)
     return f"Got it: '{qq}'. I can do status | lock | screenshot | open brave | or answer time, date, IP, subnet."
 
 ENROLL_SAMPLES = []
