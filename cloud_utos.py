@@ -34,6 +34,7 @@ def push():
     cmd_id = uuid.uuid4().hex[:8]
     PENDING[user_id] = {"cmd_id": cmd_id, "user_id": user_id, "cmd": cmd,
                         "args": d.get("args", ""), "voice": d.get("voice", ""),
+                        "persona": d.get("persona", "Jarvis"),
                         "status": "pending", "at": now()}
     return jsonify({"cmd_id": cmd_id, "status": "queued"})
 
