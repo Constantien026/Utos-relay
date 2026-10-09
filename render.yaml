@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: utos-relay
+    env: python
+    buildCommand: pip install -r requirements-utos.txt
+    startCommand: gunicorn cloud_utos:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
