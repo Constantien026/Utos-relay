@@ -316,6 +316,23 @@ def do_tabs(direction, n=1):
     except Exception as e:
         return f"tab move failed: {e}"
 
+def do_power(action, timer=30):
+    import subprocess
+    try:
+        if action == "cancel":
+            subprocess.Popen("shutdown /a", shell=True)
+            return "Shutdown cancelled, boss. We're staying on."
+        if action == "restart":
+            subprocess.Popen(f"shutdown /r /t {timer}", shell=True)
+            return f"Restarting in {timer}s, boss. Say cancel shutdown to stop it."
+        if action == "sleep":
+            subprocess.Popen("rundll32.exe powrprof.dll,SetSuspendState 0,1,0", shell=True)
+            return "Sleeping now, boss."
+        subprocess.Popen(f"shutdown /s /t {timer}", shell=True)
+        return f"Shutting down in {timer}s, boss. Say cancel shutdown to stop it."
+    except Exception as e:
+        return f"power failed: {e}"
+
 def do_media(action):
     try:
         import pyautogui
@@ -540,6 +557,19 @@ def try_command(q, persona="Jarvis"):
             except Exception:
                 pass
             return style("Captions off, boss.", persona)
+    # power: shutdown / restart / sleep / cancel (30s safety timer)
+    if re.search(r"\bcancel\b.*\bshut ?down\b", t) or re.search(r"\babort\b.*\bshut ?down\b", t):
+        return do_power("cancel")
+    m = re.search(r"\bshut ?down\b(?:\s+in\s+(\d+)\s*(?:min|m)?)?", t)
+    if m or re.search(r"\bturn off\b.*\b(laptop|pc|computer)\b", t):
+        mins = 0
+        if m and m.group(1):
+            mins = max(0, min(120, int(m.group(1))))
+        return do_power("shutdown", mins * 60 if mins else 30)
+    if re.search(r"\brestart\b|\breboot\b", t):
+        return do_power("restart")
+    if re.search(r"\bsleep\b", t) and re.search(r"\b(laptop|pc|computer|it|now)\b", t):
+        return do_power("sleep")
     # media keys
     if re.search(r"\bstop\b", t) and not re.search(r"\bstop watching\b", t):
         return do_media("pause")
@@ -670,7 +700,7 @@ def do_chat(cmd_full, persona="Jarvis"):
     if not key:
         return local + " (Tip: set GEMINI_KEY on PC for full Jarvis answers.)"
     pstyle = PERSONAS.get(persona, PERSONAS["Jarvis"])[0]
-    for model in ("gemini-flash-latest", "gemini-1.5-flash", "gemini-2.0-flash"):
+    for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):
         try:
             import json, urllib.request
             sys = (f"You are UTOS, {pstyle}. "
@@ -703,6 +733,16 @@ def do_chat(cmd_full, persona="Jarvis"):
         except Exception as e:
             print(f"[UTOS] {model} failed: {e}")
             continue
+    # Gemini down / demand spike? free keyless brain still answers
+    try:
+        import urllib.parse
+        prompt = urllib.parse.quote(sys + "\nBoss says: " + q, safe="")
+        with urllib.request.urlopen(f"https://text.pollinations.ai/{prompt}?model=openai", timeout=30) as r:
+            ans = r.read().decode()[:1200]
+            mem.push_history("boss", q); mem.push_history("utos", ans)
+            return style(ans, persona)
+    except Exception as e:
+        print(f"[UTOS] pollinations failed: {e}")
     return local
 
 def do_weather(place="Manila"):
@@ -802,6 +842,19 @@ def run_job(job):
     cmd = job.get("cmd", "")
     args = job.get("args", "")
     persona = job.get("persona", "Jarvis")
+    if cmd == "shutdown":
+        a = (args or "").lower()
+        import re as _re2
+        if "cancel" in a or "abort" in a:
+            return (style(do_power("cancel"), persona), "text")
+        if "restart" in a or "reboot" in a:
+            return (style(do_power("restart"), persona), "text")
+        if "sleep" in a:
+            return (style(do_power("sleep"), persona), "text")
+        m = _re2.search(r"(\d+)", a)
+        if m:
+            return (style(do_power("shutdown", max(0, min(7200, int(m.group(1)) * 60))), persona), "text")
+        return (style(do_power("shutdown", 30), persona), "text")
     # voice-ID gate (free, offline, no signup). Phone attaches 16kHz mono PCM b64.
     # Enroll via cmd voice_enroll (3 samples). Check others if profile exists.
     try:
