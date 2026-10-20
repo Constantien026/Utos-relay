@@ -4,7 +4,7 @@ Usage:
   python pc_agent.py --cloud http://127.0.0.1:5001 --user solo
 For different-WiFi demo, set --cloud to your Render URL.
 """
-import argparse, time, os, sys, base64, io
+import argparse, time, os, sys, base64, io, threading
 import requests
 
 try:
@@ -907,6 +907,256 @@ def run_job(job):
         return (r, "text")
     return (f"Unknown cmd '{cmd}'. Try status, lock, screenshot, open brave, chat hi", "text")
 
+# ---------------- Monitor tab: live mirror + touch (LAN direct, cloudflared tunnel for data) ----
+MON = {"lan": "", "tunnel": "", "port": 8555, "w": 1920, "h": 1080}
+
+def _lan_ip():
+    """All candidate IPs, best first: home LAN > 10.x > 172.x > Tailscale (100.x). Comma-joined."""
+    import socket
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        if not s.getsockname()[0].startswith("127."):
+            ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    try:
+        for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = i[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+
+    def score(ip):
+        if ip.startswith("192.168."):
+            return 0
+        if ip.startswith("10."):
+            return 1
+        if ip.startswith("172."):
+            return 2
+        if ip.startswith("100."):
+            return 3  # Tailscale - works anywhere if the phone runs Tailscale too
+        return 4
+    return ",".join(sorted(ips, key=score))
+
+def _type_text(txt):
+    import subprocess, pyautogui
+    try:
+        # clipboard + paste: handles unicode that pyautogui.write can't
+        ps = "Set-Clipboard -Value '" + txt.replace("'", "''") + "'"
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=10,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        pyautogui.hotkey("ctrl", "v")
+        return
+    except Exception:
+        pass
+    try:
+        pyautogui.write(txt, interval=0.02)
+    except Exception:
+        pass
+
+def _start_monitor_server():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import json as _json
+    import urllib.parse as _up
+    try:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+    except Exception:
+        pyautogui = None
+    try:
+        from mss import mss as _mss
+        with _mss() as _s:
+            MON["w"], MON["h"] = _s.monitors[1]["width"], _s.monitors[1]["height"]
+    except Exception:
+        pass
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+        def _json(self, obj, code=200):
+            b = _json.dumps(obj).encode()
+            self.send_response(code)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self._cors()
+            self.end_headers()
+
+        def do_GET(self):
+            try:
+                u = _up.urlparse(self.path)
+                if u.path == "/info":
+                    self._json({"w": MON["w"], "h": MON["h"], "agent": "utos-monitor"})
+                    return
+                if u.path == "/frame":
+                    qs = _up.parse_qs(u.query)
+                    try:
+                        w = max(320, min(1600, int(qs.get("w", ["960"])[0])))
+                    except Exception:
+                        w = 960
+                    try:
+                        q = max(20, min(85, int(qs.get("q", ["55"])[0])))
+                    except Exception:
+                        q = 55
+                    from mss import mss
+                    from PIL import Image, ImageDraw
+                    with mss() as sct:
+                        shot = sct.grab(sct.monitors[1])
+                        img = Image.frombytes("RGB", shot.size, shot.rgb)
+                    if img.width > w:
+                        img = img.resize((w, int(img.height * w / img.width)), Image.BILINEAR)
+                    if pyautogui:
+                        try:
+                            r = img.width / float(MON["w"])
+                            cx, cy = int(pyautogui.position()[0] * r), int(pyautogui.position()[1] * r)
+                            ImageDraw.Draw(img).ellipse((cx - 7, cy - 7, cx + 7, cy + 7),
+                                                        outline=(0, 255, 136), width=3)
+                        except Exception:
+                            pass
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=q)
+                    b = buf.getvalue()
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                self._json({"err": "unknown"}, 404)
+            except Exception as e:
+                try:
+                    self._json({"err": str(e)}, 500)
+                except Exception:
+                    pass
+
+        def do_POST(self):
+            try:
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                try:
+                    d = _json.loads(self.rfile.read(n) or b"{}")
+                except Exception:
+                    d = {}
+                path = _up.urlparse(self.path).path
+                if path == "/touch":
+                    nx = max(0.0, min(1.0, float(d.get("x", 0))))
+                    ny = max(0.0, min(1.0, float(d.get("y", 0))))
+                    px, py = int(nx * (MON["w"] - 1)), int(ny * (MON["h"] - 1))
+                    act = d.get("action", "click")
+                    if pyautogui:
+                        if act == "move":
+                            pyautogui.moveTo(px, py)
+                        elif act == "down":
+                            pyautogui.moveTo(px, py)
+                            pyautogui.mouseDown()
+                        elif act == "up":
+                            pyautogui.moveTo(px, py)
+                            pyautogui.mouseUp()
+                        elif act == "right":
+                            pyautogui.rightClick(px, py)
+                        elif act == "double":
+                            pyautogui.doubleClick(px, py)
+                        else:
+                            pyautogui.click(px, py)
+                    self._json({"ok": True})
+                    return
+                if path == "/scroll":
+                    if pyautogui:
+                        dy = int(d.get("dy", 0))
+                        pyautogui.scroll(max(-10, min(10, int(dy / 40))))
+                    self._json({"ok": True})
+                    return
+                if path == "/key":
+                    if pyautogui:
+                        k = str(d.get("key", ""))
+                        if k:
+                            if "+" in k:
+                                pyautogui.hotkey(*k.split("+"))
+                            else:
+                                pyautogui.press(k)
+                        txt = str(d.get("text", ""))
+                        if txt:
+                            _type_text(txt)
+                    self._json({"ok": True})
+                    return
+                self._json({"err": "unknown"}, 404)
+            except Exception as e:
+                try:
+                    self._json({"err": str(e)}, 500)
+                except Exception:
+                    pass
+
+    srv = ThreadingHTTPServer(("0.0.0.0", MON["port"]), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    print(f"[UTOS] monitor server on :{MON['port']} ({MON['w']}x{MON['h']})")
+    return srv
+
+def _start_tunnel():
+    """cloudflared quick tunnel = public https URL so the phone can mirror on mobile data. No signup."""
+    import re
+    import subprocess
+    import urllib.request
+    exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloudflared.exe")
+    if not os.path.exists(exe):
+        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+        print("[UTOS] downloading cloudflared (one time)...")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "UTOS"})
+            with urllib.request.urlopen(req, timeout=600) as r, open(exe + ".tmp", "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            os.replace(exe + ".tmp", exe)
+            print("[UTOS] cloudflared ready")
+        except Exception as e:
+            print("[UTOS] cloudflared download failed:", e)
+            return
+    try:
+        p = subprocess.Popen([exe, "tunnel", "--url", f"http://127.0.0.1:{MON['port']}", "--no-autoupdate"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        print("[UTOS] tunnel spawn failed:", e)
+        return
+    for raw in p.stdout:
+        try:
+            line = raw.decode("utf-8", "ignore")
+        except Exception:
+            continue
+        m = re.search(r"(https://[a-z0-9-]+\.trycloudflare\.com)", line)
+        if m and m.group(1) != MON["tunnel"]:
+            MON["tunnel"] = m.group(1)
+            print("[UTOS] tunnel up:", m.group(1))
+        elif "ERR" in line and not MON["tunnel"]:
+            print("[UTOS] tunnel:", line.strip()[:200])
+
+def start_monitor():
+    MON["lan"] = _lan_ip()
+    try:
+        threading.Thread(target=_start_monitor_server, daemon=True).start()
+    except Exception as e:
+        print("[UTOS] monitor server failed:", e)
+    threading.Thread(target=_start_tunnel, daemon=True).start()
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cloud", default="http://127.0.0.1:5001")
@@ -914,11 +1164,15 @@ def main():
     a = ap.parse_args()
     cloud = a.cloud.rstrip("/")
     user = a.user
+    start_monitor()
     print(f"[UTOS] polling {cloud} as user={user}")
     print("[UTOS] v7 personas+memory+follow (if you don't see v7, you run old file)")
     while True:
         try:
-            requests.post(f"{cloud}/api/utos/heartbeat", json={"user_id": user}, timeout=8)
+            requests.post(f"{cloud}/api/utos/heartbeat",
+                          json={"user_id": user, "lan": MON["lan"], "tunnel": MON["tunnel"],
+                                "w": MON["w"], "h": MON["h"], "mon": MON["port"]},
+                          timeout=8)
             r = requests.get(f"{cloud}/api/utos/poll", params={"user_id": user}, timeout=10)
             job = r.json()
             if job.get("cmd"):

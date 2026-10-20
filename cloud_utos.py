@@ -23,6 +23,8 @@ def now():
 def pc_online(user_id):
     """PC agent heartbeats every 2s, so fresh = online."""
     last = SEEN.get(user_id)
+    if isinstance(last, dict):
+        last = last.get("at")
     if not last:
         return False
     try:
@@ -107,7 +109,12 @@ def push():
 @app.route("/api/utos/poll")
 def poll():
     user_id = request.args.get("user_id", "solo")
-    SEEN[user_id] = now()  # polling itself proves the PC agent is alive
+    # polling itself proves the PC agent is alive
+    rec = SEEN.get(user_id)
+    if not isinstance(rec, dict):
+        rec = {}
+    rec["at"] = now()
+    SEEN[user_id] = rec
     job = PENDING.get(user_id)
     if not job:
         return jsonify({"cmd": None})
@@ -137,14 +144,24 @@ def get_result(cmd_id):
 def heartbeat():
     d = request.json or {}
     user_id = d.get("user_id", "solo")
-    SEEN[user_id] = now()
-    return jsonify({"ok": True, "at": SEEN[user_id]})
+    rec = SEEN.get(user_id)
+    if not isinstance(rec, dict):
+        rec = {}
+    for k in ("lan", "tunnel", "w", "h", "mon"):
+        if d.get(k):
+            rec[k] = d[k]
+    rec["at"] = now()
+    SEEN[user_id] = rec
+    return jsonify({"ok": True, "at": rec["at"]})
 
 @app.route("/api/utos/status")
 def status():
     user_id = request.args.get("user_id", "solo")
-    last = SEEN.get(user_id)
-    return jsonify({"online": pc_online(user_id), "last_seen": last, "has_pending": user_id in PENDING})
+    rec = SEEN.get(user_id) if isinstance(SEEN.get(user_id), dict) else {}
+    return jsonify({"online": pc_online(user_id), "last_seen": rec.get("at"),
+                    "has_pending": user_id in PENDING,
+                    "lan": rec.get("lan", ""), "tunnel": rec.get("tunnel", ""),
+                    "w": rec.get("w", 0), "h": rec.get("h", 0), "mon": rec.get("mon", 8555)})
 
 if __name__ == "__main__":
     import os
