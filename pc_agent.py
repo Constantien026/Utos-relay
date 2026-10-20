@@ -1035,9 +1035,15 @@ def _win_scroll(wid, dy):
     if not hwnd:
         return False
     user32 = ctypes.windll.user32
-    rect = wintypes.RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(rect))
-    lp = (((rect.top + 40) & 0xFFFF) << 16) | ((rect.left + 40) & 0xFFFF)
+    # aim right-of-center: the video player swallows wheel events, while
+    # lists/scrollbars (in almost every app) live on the right side
+    cr = wintypes.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(cr))
+    org = wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(org))
+    sx = org.x + int(cr.right * 0.85)
+    sy = org.y + int(cr.bottom * 0.45)
+    lp = ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)
     notches = max(-10, min(10, int(dy / 40)))
     wparam = ((notches * 120) & 0xFFFF) << 16
     user32.PostMessageW(hwnd, 0x020A, wparam, lp)  # WM_MOUSEWHEEL
@@ -1083,6 +1089,83 @@ def _window_raise(wid):
     except Exception:
         pass
     return False
+
+_PARK = {}      # wid -> (left, top) of where the window really lives
+_PARK_SEEN = {} # wid -> last time the phone streamed this window
+_PARK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parked.json")
+
+def _park_watchdog():
+    """phone stopped streaming a parked window (app closed / lost link) ->
+    bring it back to the laptop so nothing stays stranded off-screen."""
+    while True:
+        time.sleep(20)
+        now = time.time()
+        for wid in list(_PARK.keys()):
+            seen = _PARK_SEEN.get(wid, 0)
+            if now - seen > 90:
+                if _win_unpark(wid):
+                    print(f"[UTOS] parked window {wid} came home (phone stopped streaming)")
+
+def _park_save():
+    try:
+        json.dump(_PARK, open(_PARK_FILE, "w"))
+    except Exception:
+        pass
+
+def _win_park(wid):
+    """Give the window to the phone: slide it off the laptop screen except a
+    2px sliver at the right edge. The sliver keeps DWM compositing the window
+    (fully off-screen / 'invisible' windows stop rendering -> frozen feed),
+    so the phone gets a truly LIVE picture while the laptop is free."""
+    import ctypes
+    from ctypes import wintypes
+    hwnd = _window_handle(wid)
+    if not hwnd or wid in _PARK:
+        return False
+    user32 = ctypes.windll.user32
+    r = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    _PARK[wid] = (r.left, r.top)
+    screen_w = user32.GetSystemMetrics(0)  # primary screen width
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
+    ok = user32.SetWindowPos(hwnd, 0, screen_w - 2, 100, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+    if not ok:
+        _PARK.pop(wid, None)
+        return False
+    _park_save()
+    return True
+
+def _win_unpark(wid):
+    import ctypes
+    from ctypes import wintypes
+    hwnd = _window_handle(wid)
+    pos = _PARK.pop(wid, None)
+    _park_save()
+    if not hwnd or not pos:
+        return False
+    user32 = ctypes.windll.user32
+    try:
+        DWMWA_CLOAKED = 14
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_CLOAKED, ctypes.byref(ctypes.c_int(0)), ctypes.sizeof(ctypes.c_int))
+    except Exception:
+        pass
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
+    user32.SetWindowPos(hwnd, 0, pos[0], pos[1], 0, 0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+    return True
+
+def _park_restore_all():
+    """crash safety: never leave a window stranded off-screen."""
+    global _PARK
+    try:
+        if os.path.exists(_PARK_FILE):
+            _PARK = json.load(open(_PARK_FILE))
+    except Exception:
+        _PARK = {}
+    for wid in list(_PARK.keys()):
+        _win_unpark(wid)
 
 def _grab_window(wid):
     """PrintWindow capture: reads a window's own content even when it is
@@ -1276,6 +1359,8 @@ def _start_monitor_server():
                     region = {"left": MON.get("left", 0), "top": MON.get("top", 0),
                               "width": MON["w"], "height": MON["h"]}
                     wid = (qs.get("wid", [""])[0] or "").strip()
+                    if wid:
+                        _PARK_SEEN[wid] = time.time()
                     img = None
                     if wid:
                         img = _grab_window(wid)
@@ -1391,6 +1476,14 @@ def _start_monitor_server():
                         _mon_power(False)
                     elif m == "raise":
                         _window_raise(str(d.get("wid", "")))
+                    elif m == "park":
+                        ok = _win_park(str(d.get("wid", "")))
+                        self._json({"ok": ok})
+                        return
+                    elif m == "unpark":
+                        ok = _win_unpark(str(d.get("wid", "")))
+                        self._json({"ok": ok})
+                        return
                     else:
                         PRIV["on"] = False
                         if m == "on":
@@ -1407,6 +1500,7 @@ def _start_monitor_server():
     srv = ThreadingHTTPServer(("0.0.0.0", MON["port"]), H)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
+    threading.Thread(target=_park_watchdog, daemon=True).start()
     print(f"[UTOS] monitor server on :{MON['port']} ({MON['w']}x{MON['h']})")
     return srv
 
@@ -1467,6 +1561,7 @@ def main():
     a = ap.parse_args()
     cloud = a.cloud.rstrip("/")
     user = a.user
+    _park_restore_all()   # crash safety: windows parked off-screen come home
     start_monitor()
     print(f"[UTOS] polling {cloud} as user={user}")
     print("[UTOS] v7 personas+memory+follow (if you don't see v7, you run old file)")
