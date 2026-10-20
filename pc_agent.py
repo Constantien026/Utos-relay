@@ -937,6 +937,22 @@ def _win_id(title):
     import hashlib
     return hashlib.md5(title.encode("utf-8", "ignore")).hexdigest()[:8]
 
+def _wid_of(w):
+    """stable id = the window handle (titles change - music players put the
+    track name in the title - which used to silently break Extend mid-song)."""
+    h = getattr(w, "_hWnd", None) or getattr(w, "_handle", None)
+    return str(h) if h else _win_id(w.title)
+
+def _wid_match(w, wid):
+    if not wid:
+        return False
+    if _wid_of(w) == wid:
+        return True
+    try:
+        return _win_id(w.title) == wid  # legacy ids from older app versions
+    except Exception:
+        return False
+
 def _windows_list():
     out = []
     seen = set()
@@ -944,21 +960,120 @@ def _windows_list():
         import pygetwindow as gw
         for w in gw.getAllWindows():
             try:
-                if w.visible and w.title and w.width > 80 and w.height > 80 and _win_id(w.title) not in seen:
-                    seen.add(_win_id(w.title))
-                    out.append({"id": _win_id(w.title), "title": w.title[:70]})
+                wid = _wid_of(w)
+                if w.visible and w.title and w.width > 80 and w.height > 80 and wid not in seen:
+                    seen.add(wid)
+                    out.append({"id": wid, "title": w.title[:70]})
             except Exception:
                 continue
     except Exception:
         pass
     return out
 
+def _window_handle(wid):
+    try:
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            try:
+                if _wid_match(w, wid):
+                    h = getattr(w, "_hWnd", None) or getattr(w, "_handle", None)
+                    if h:
+                        return h
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+def _win_client_point(hwnd, nx, ny):
+    """normalized frame coords -> client-area pixels of that window."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    org = wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(org))
+    sx = rect.left + int(nx * (rect.right - rect.left))
+    sy = rect.top + int(ny * (rect.bottom - rect.top))
+    return sx - org.x, sy - org.y
+
+def _win_touch(wid, d):
+    """Click/drag INSIDE a specific window via posted messages - the laptop's
+    foreground and global cursor are never involved."""
+    import ctypes
+    hwnd = _window_handle(wid)
+    if not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    nx = max(0.0, min(1.0, float(d.get("x", 0))))
+    ny = max(0.0, min(1.0, float(d.get("y", 0))))
+    cx, cy = _win_client_point(hwnd, nx, ny)
+    lp = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+    act = d.get("action", "click")
+    WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0200, 0x0201, 0x0202
+    WM_RBUTTONDOWN, WM_RBUTTONUP, MK_LBUTTON = 0x0204, 0x0205, 0x0001
+    if act == "down":
+        user32.PostMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, lp)
+        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
+    elif act == "move":
+        user32.PostMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, lp)
+    elif act == "up":
+        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lp)
+    elif act == "right":
+        user32.PostMessageW(hwnd, WM_RBUTTONDOWN, 0, lp)
+        user32.PostMessageW(hwnd, WM_RBUTTONUP, 0, lp)
+    else:
+        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
+        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lp)
+    return True
+
+def _win_scroll(wid, dy):
+    import ctypes
+    from ctypes import wintypes
+    hwnd = _window_handle(wid)
+    if not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    lp = (((rect.top + 40) & 0xFFFF) << 16) | ((rect.left + 40) & 0xFFFF)
+    notches = max(-10, min(10, int(dy / 40)))
+    wparam = ((notches * 120) & 0xFFFF) << 16
+    user32.PostMessageW(hwnd, 0x020A, wparam, lp)  # WM_MOUSEWHEEL
+    return True
+
+_VK = {"esc": 0x1B, "escape": 0x1B, "enter": 0x0D, "return": 0x0D, "tab": 0x09,
+       "backspace": 0x08, "space": 0x20, "left": 0x25, "up": 0x26, "right": 0x27,
+       "down": 0x28, "home": 0x24, "end": 0x23, "delete": 0x2E, "pageup": 0x21,
+       "pagedown": 0x22, "shift": 0x10, "ctrl": 0x11, "alt": 0x12}
+
+def _win_key(wid, key, text=""):
+    """Post key/char messages straight into a window (no focus steal)."""
+    import ctypes
+    hwnd = _window_handle(wid)
+    if not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    WM_KEYDOWN, WM_KEYUP, WM_CHAR = 0x0100, 0x0101, 0x0102
+    if key:
+        vk = _VK.get(key.lower())
+        if vk is None and len(key) == 1:
+            vk = ord(key.upper())
+        if vk:
+            user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
+            user32.PostMessageW(hwnd, WM_KEYUP, vk, 0)
+    if text:
+        for ch in text:
+            user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+    return True
+
 def _window_raise(wid):
     try:
         import pygetwindow as gw
         for w in gw.getAllWindows():
             try:
-                if _win_id(w.title) == wid:
+                if _wid_match(w, wid):
                     if w.isMinimized:
                         w.restore()
                     w.activate()
@@ -969,12 +1084,77 @@ def _window_raise(wid):
         pass
     return False
 
+def _grab_window(wid):
+    """PrintWindow capture: reads a window's own content even when it is
+    covered by other windows - so Extend never has to touch the PC screen.
+    Returns a PIL Image, or None (some GPU/protected windows refuse)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import numpy as _np
+        import pygetwindow as gw
+        hwnd = None
+        for w in gw.getAllWindows():
+            if _wid_match(w, wid):
+                hwnd = getattr(w, "_hWnd", None) or getattr(w, "_handle", None) or getattr(w, "_hwnd", None)
+                if hwnd:
+                    break
+        if not hwnd:
+            return None
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            return None
+        hwnd_dc = user32.GetWindowDC(hwnd)
+        mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+        bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+        gdi32.SelectObject(mem_dc, bmp)
+        # 2 = PW_RENDERFULLCONTENT (works for Chrome/Brave/Electron too)
+        ok = user32.PrintWindow(hwnd, mem_dc, 2)
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD),
+            ]
+        bi = BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.biWidth = width
+        bi.biHeight = -height  # top-down
+        bi.biPlanes = 1
+        bi.biBitCount = 32
+        buf = ctypes.create_string_buffer(width * height * 4)
+        got = gdi32.GetDIBits(mem_dc, bmp, 0, height, buf, ctypes.byref(bi), 0)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(hwnd, hwnd_dc)
+        if not ok or got == 0:
+            return None
+        arr = _np.frombuffer(buf.raw, dtype=_np.uint8).reshape(height, width, 4)[:, :, :3]
+        from PIL import Image
+        img = Image.fromarray(arr[:, :, ::-1])  # BGRA -> RGB
+        # all-black usually means the window refused (game/anti-cheat) -> caller falls back
+        if img.convert("L").getextrema()[1] < 8:
+            return None
+        return img
+    except Exception as e:
+        print("[UTOS] PrintWindow failed:", e)
+        return None
+
 def _window_rect(wid):
     try:
         import pygetwindow as gw
         for w in gw.getAllWindows():
             try:
-                if _win_id(w.title) == wid and w.width > 0 and w.height > 0:
+                if _wid_match(w, wid) and w.width > 0 and w.height > 0:
                     return {"left": int(w.left), "top": int(w.top),
                             "width": int(w.width), "height": int(w.height)}
             except Exception:
@@ -1091,22 +1271,27 @@ def _start_monitor_server():
                         q = max(20, min(85, int(qs.get("q", ["55"])[0])))
                     except Exception:
                         q = 55
-                    # extend mode: capture one window's region instead of the whole screen
+                    # extend mode: the window's OWN pixels (even when covered) -
+                    # the PC screen is left alone entirely
                     region = {"left": MON.get("left", 0), "top": MON.get("top", 0),
                               "width": MON["w"], "height": MON["h"]}
                     wid = (qs.get("wid", [""])[0] or "").strip()
+                    img = None
                     if wid:
-                        wr = _window_rect(wid)
-                        if wr and wr["width"] > 40 and wr["height"] > 40:
-                            region = wr
+                        img = _grab_window(wid)
+                        if img is None:
+                            wr = _window_rect(wid)
+                            if wr and wr["width"] > 40 and wr["height"] > 40:
+                                region = wr
                     from mss import mss
                     from PIL import Image, ImageDraw
-                    with mss() as sct:
-                        shot = sct.grab(region)
-                        img = Image.frombytes("RGB", shot.size, shot.rgb)
+                    if img is None:
+                        with mss() as sct:
+                            shot = sct.grab(region)
+                            img = Image.frombytes("RGB", shot.size, shot.rgb)
                     if img.width > w:
                         img = img.resize((w, int(img.height * w / img.width)), Image.BILINEAR)
-                    if pyautogui:
+                    if pyautogui and img is not None and not wid:
                         try:
                             r = img.width / float(region["width"])
                             px, py = pyautogui.position()
@@ -1143,6 +1328,10 @@ def _start_monitor_server():
                     d = {}
                 path = _up.urlparse(self.path).path
                 if path == "/touch":
+                    wid = str(d.get("wid", "")).strip()
+                    if wid and _win_touch(wid, d):
+                        self._json({"ok": True, "win": True})
+                        return
                     nx = max(0.0, min(1.0, float(d.get("x", 0))))
                     ny = max(0.0, min(1.0, float(d.get("y", 0))))
                     px, py = int(nx * (MON["w"] - 1)), int(ny * (MON["h"] - 1))
@@ -1165,20 +1354,31 @@ def _start_monitor_server():
                     self._json({"ok": True})
                     return
                 if path == "/scroll":
+                    wid = str(d.get("wid", "")).strip()
+                    dy = int(d.get("dy", 0))
+                    if wid and _win_scroll(wid, dy):
+                        self._json({"ok": True, "win": True})
+                        return
                     if pyautogui:
-                        dy = int(d.get("dy", 0))
                         pyautogui.scroll(max(-10, min(10, int(dy / 40))))
                     self._json({"ok": True})
                     return
                 if path == "/key":
+                    wid = str(d.get("wid", "").strip() if d.get("wid") else "")
+                    k = str(d.get("key", ""))
+                    txt = str(d.get("text", ""))
+                    # plain keys/typing go into the Extend window (no focus steal);
+                    # combos like alt+tab are system-level -> global path
+                    if wid and not ("+" in k):
+                        if _win_key(wid, k, txt):
+                            self._json({"ok": True, "win": True})
+                            return
                     if pyautogui:
-                        k = str(d.get("key", ""))
                         if k:
                             if "+" in k:
                                 pyautogui.hotkey(*k.split("+"))
                             else:
                                 pyautogui.press(k)
-                        txt = str(d.get("text", ""))
                         if txt:
                             _type_text(txt)
                     self._json({"ok": True})
