@@ -909,6 +909,79 @@ def run_job(job):
 
 # ---------------- Monitor tab: live mirror + touch (LAN direct, cloudflared tunnel for data) ----
 MON = {"lan": "", "tunnel": "", "port": 8555, "w": 1920, "h": 1080}
+PRIV = {"on": False}  # "Second screen only": phone drives, PC monitor stays dark
+
+def _mon_power(on):
+    try:
+        import ctypes
+        # WM_SYSCOMMAND=0x0112, SC_MONITORPOWER=0xF170, -1=on, 2=off
+        ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, -1 if on else 2)
+    except Exception:
+        pass
+
+def _privacy_loop():
+    """Keep the PC monitor dark while the phone is the only screen; any real
+    (physical) input at the PC wakes it, our injected input re-dims it.
+    Auto-expires after 45s without a keepalive so a dead phone can't leave
+    the PC dark forever."""
+    while True:
+        if PRIV["on"]:
+            if time.time() - PRIV.get("at", 0) > 45:
+                PRIV["on"] = False
+                _mon_power(True)
+            else:
+                _mon_power(False)
+        time.sleep(2)
+
+def _win_id(title):
+    import hashlib
+    return hashlib.md5(title.encode("utf-8", "ignore")).hexdigest()[:8]
+
+def _windows_list():
+    out = []
+    seen = set()
+    try:
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            try:
+                if w.visible and w.title and w.width > 80 and w.height > 80 and _win_id(w.title) not in seen:
+                    seen.add(_win_id(w.title))
+                    out.append({"id": _win_id(w.title), "title": w.title[:70]})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+def _window_raise(wid):
+    try:
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            try:
+                if _win_id(w.title) == wid:
+                    if w.isMinimized:
+                        w.restore()
+                    w.activate()
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+def _window_rect(wid):
+    try:
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            try:
+                if _win_id(w.title) == wid and w.width > 0 and w.height > 0:
+                    return {"left": int(w.left), "top": int(w.top),
+                            "width": int(w.width), "height": int(w.height)}
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
 
 def _lan_ip():
     """All candidate IPs, best first: home LAN > 10.x > 172.x > Tailscale (100.x). Comma-joined."""
@@ -972,8 +1045,9 @@ def _start_monitor_server():
         from mss import mss as _mss
         with _mss() as _s:
             MON["w"], MON["h"] = _s.monitors[1]["width"], _s.monitors[1]["height"]
+            MON["left"], MON["top"] = _s.monitors[1]["left"], _s.monitors[1]["top"]
     except Exception:
-        pass
+        MON["left"], MON["top"] = 0, 0
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -1004,6 +1078,9 @@ def _start_monitor_server():
                 if u.path == "/info":
                     self._json({"w": MON["w"], "h": MON["h"], "agent": "utos-monitor"})
                     return
+                if u.path == "/windows":
+                    self._json({"windows": _windows_list()})
+                    return
                 if u.path == "/frame":
                     qs = _up.parse_qs(u.query)
                     try:
@@ -1014,19 +1091,30 @@ def _start_monitor_server():
                         q = max(20, min(85, int(qs.get("q", ["55"])[0])))
                     except Exception:
                         q = 55
+                    # extend mode: capture one window's region instead of the whole screen
+                    region = {"left": MON.get("left", 0), "top": MON.get("top", 0),
+                              "width": MON["w"], "height": MON["h"]}
+                    wid = (qs.get("wid", [""])[0] or "").strip()
+                    if wid:
+                        wr = _window_rect(wid)
+                        if wr and wr["width"] > 40 and wr["height"] > 40:
+                            region = wr
                     from mss import mss
                     from PIL import Image, ImageDraw
                     with mss() as sct:
-                        shot = sct.grab(sct.monitors[1])
+                        shot = sct.grab(region)
                         img = Image.frombytes("RGB", shot.size, shot.rgb)
                     if img.width > w:
                         img = img.resize((w, int(img.height * w / img.width)), Image.BILINEAR)
                     if pyautogui:
                         try:
-                            r = img.width / float(MON["w"])
-                            cx, cy = int(pyautogui.position()[0] * r), int(pyautogui.position()[1] * r)
-                            ImageDraw.Draw(img).ellipse((cx - 7, cy - 7, cx + 7, cy + 7),
-                                                        outline=(0, 255, 136), width=3)
+                            r = img.width / float(region["width"])
+                            px, py = pyautogui.position()
+                            cx = int((px - region["left"]) * r)
+                            cy = int((py - region["top"]) * r)
+                            if 0 <= cx < img.width and 0 <= cy < img.height:
+                                ImageDraw.Draw(img).ellipse((cx - 7, cy - 7, cx + 7, cy + 7),
+                                                            outline=(0, 255, 136), width=3)
                         except Exception:
                             pass
                     buf = io.BytesIO()
@@ -1095,6 +1183,20 @@ def _start_monitor_server():
                             _type_text(txt)
                     self._json({"ok": True})
                     return
+                if path == "/display":
+                    m = str(d.get("mode", "on"))
+                    if m == "privacy":
+                        PRIV["on"] = True
+                        PRIV["at"] = time.time()
+                        _mon_power(False)
+                    elif m == "raise":
+                        _window_raise(str(d.get("wid", "")))
+                    else:
+                        PRIV["on"] = False
+                        if m == "on":
+                            _mon_power(True)
+                    self._json({"ok": True})
+                    return
                 self._json({"err": "unknown"}, 404)
             except Exception as e:
                 try:
@@ -1155,6 +1257,7 @@ def start_monitor():
         threading.Thread(target=_start_monitor_server, daemon=True).start()
     except Exception as e:
         print("[UTOS] monitor server failed:", e)
+    threading.Thread(target=_privacy_loop, daemon=True).start()
     threading.Thread(target=_start_tunnel, daemon=True).start()
 
 def main():
