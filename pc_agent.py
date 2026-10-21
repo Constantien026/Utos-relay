@@ -1013,7 +1013,10 @@ def _win_touch(wid, d):
     act = d.get("action", "click")
     WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0200, 0x0201, 0x0202
     WM_RBUTTONDOWN, WM_RBUTTONUP, MK_LBUTTON = 0x0204, 0x0205, 0x0001
-    if act == "down":
+    if act == "hover":
+        # no button: the cursor lands/hovers so the target renders its hover state
+        user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lp)
+    elif act == "down":
         user32.PostMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, lp)
         user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
     elif act == "move":
@@ -1067,11 +1070,12 @@ def _win_key(wid, key, text=""):
         if vk is None and len(key) == 1:
             vk = ord(key.upper())
         if vk:
-            user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
-            user32.PostMessageW(hwnd, WM_KEYUP, vk, 0)
+            # lparam MUST carry repeat-count 1 (0 = "0 repeats" = dropped by Chromium)
+            user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 1)
+            user32.PostMessageW(hwnd, WM_KEYUP, vk, 1)
     if text:
         for ch in text:
-            user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+            user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 1)
     return True
 
 def _window_raise(wid):
@@ -1422,7 +1426,7 @@ def _start_monitor_server():
                     px, py = int(nx * (MON["w"] - 1)), int(ny * (MON["h"] - 1))
                     act = d.get("action", "click")
                     if pyautogui:
-                        if act == "move":
+                        if act in ("move", "hover"):
                             pyautogui.moveTo(px, py)
                         elif act == "down":
                             pyautogui.moveTo(px, py)
